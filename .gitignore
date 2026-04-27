@@ -1,0 +1,12 @@
+# تجاهل مجلدات الصور الضخمة
+nih_images/
+chest_xray/
+medical_ai_model.pth
+
+# تجاهل ملفات النظام المزعجة
+.DS_Store
+__pycache__/
+
+# تجاهل البيئة الافتراضية إذا كنت تستخدمها
+venv/
+env/
