@@ -6,3 +6,10 @@ Pillow
 grad-cam
 opencv-python-headless
 numpy
+albumentations==1.3.1
+pandas
+scikit-learn
+fastapi
+uvicorn[standard]
+python-multipart
+mlflow

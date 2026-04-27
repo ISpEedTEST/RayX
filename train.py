@@ -1,78 +1,136 @@
+# train.py
+import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader
-import os
+from torch.cuda.amp import GradScaler, autocast
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+import mlflow
+from model import ChestXRayClassifier
+from dataset import NIHChestXrayDataset
+from config import *
 
-print("Setting up the training environment and data...")
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
 
-# 1. Enable GPU for faster training
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def forward(self, inputs, targets):
+        bce = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-bce)
+        focal = self.alpha * (1 - pt) ** self.gamma * bce
+        return focal.mean()
 
-# 2. Data processing: Resize images and convert to Tensors
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+def main():
+    device = torch.device(DEVICE if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-# 3. Load images from directory and create batches (32 images per batch)
-train_dir = "./chest_xray/train"
-train_data = datasets.ImageFolder(train_dir, transform=transform)
-train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
+    df = pd.read_csv(LABEL_FILE)
+    # Optional: keep only frontal PA views (uncomment if desired)
+    # df = df[df['View Position'] == 'PA']
+    df = df.reset_index(drop=True)
 
-# 4. Load the pre-trained model (ResNet18) and modify it for our project
-model = models.resnet18(weights='DEFAULT')
-num_ftrs = model.fc.in_features
-model.fc = nn.Linear(num_ftrs, 2) # Modify output to 2 classes (Normal / Pneumonia)
-model = model.to(device) # Move model to GPU
+    train_df, temp_df = train_test_split(df, test_size=0.3, random_state=42)
+    val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
 
-# 5. Define the Loss function and Optimizer
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+    print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
-# 6. Start the Training Loop
-epochs = 20 # Training for 20 epochs as a start
-print(f"Training started on GPU: {torch.cuda.get_device_name(0)}")
-print("-" * 40)
+    train_dataset = NIHChestXrayDataset(train_df, DATA_ROOT, is_train=True)
+    val_dataset = NIHChestXrayDataset(val_df, DATA_ROOT, is_train=False)
+    test_dataset = NIHChestXrayDataset(test_df, DATA_ROOT, is_train=False)
 
-for epoch in range(epochs):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    
-    # Iterate over data batches
-    for i, (inputs, labels) in enumerate(train_loader):
-        inputs, labels = inputs.to(device), labels.to(device)
-        
-        # Zero the parameter gradients
-        optimizer.zero_grad()
-        
-        # Forward pass, calculate loss
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        
-        # Backward pass, optimize (Real learning happens here)
-        loss.backward()
-        optimizer.step()
-        
-        # Calculate accuracy
-        running_loss += loss.item()
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        
-        # Print updates every 10 batches
-        if (i+1) % 10 == 0:
-            print(f"Batch [{i+1}/{len(train_loader)}] | Loss: {loss.item():.4f}")
+    # Windows fix: num_workers = 0
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
 
-    # Final epoch accuracy
-    epoch_acc = 100 * correct / total
-    print("-" * 40)
-    print(f"Epoch {epoch+1} finished! | Current Model Accuracy: {epoch_acc:.2f}%")
+    model = ChestXRayClassifier(num_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=0.5)
 
-# 7. Save the trained model's brain
-torch.save(model.state_dict(), 'medical_ai_model.pth')
-print("Model saved successfully as: medical_ai_model.pth")
+    if USE_FOCAL_LOSS:
+        criterion = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
+    else:
+        criterion = nn.BCEWithLogitsLoss()
+
+    scaler = GradScaler()
+    best_auroc = 0.0
+    patience_counter = 0
+
+    mlflow.set_experiment("chest_xray_5diseases")
+    with mlflow.start_run():
+        mlflow.log_params({
+            "backbone": BACKBONE,
+            "batch_size": BATCH_SIZE,
+            "lr": LEARNING_RATE,
+            "use_focal": USE_FOCAL_LOSS,
+            "img_size": IMG_SIZE,
+            "num_classes": NUM_CLASSES
+        })
+
+        for epoch in range(EPOCHS):
+            model.train()
+            train_loss = 0.0
+            for images, labels in train_loader:
+                images, labels = images.to(device), labels.to(device)
+                optimizer.zero_grad()
+                with autocast():
+                    logits = model(images)
+                    loss = criterion(logits, labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                train_loss += loss.item()
+
+            model.eval()
+            all_probs = []
+            all_labels = []
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    logits = model(images)
+                    probs = torch.sigmoid(logits).cpu().numpy()
+                    all_probs.append(probs)
+                    all_labels.append(labels.cpu().numpy())
+            probs = np.vstack(all_probs)
+            labels = np.vstack(all_labels)
+            auroc = roc_auc_score(labels, probs, average='macro')
+            print(f"Epoch {epoch+1}: loss {train_loss/len(train_loader):.4f}, val AUROC {auroc:.4f}")
+            mlflow.log_metrics({"train_loss": train_loss/len(train_loader), "val_auroc": auroc}, step=epoch)
+
+            scheduler.step(auroc)
+
+            if auroc > best_auroc:
+                best_auroc = auroc
+                torch.save(model.state_dict(), "best_model.pth")
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= PATIENCE:
+                    print("Early stopping")
+                    break
+
+        # Test evaluation
+        model.load_state_dict(torch.load("best_model.pth"))
+        model.eval()
+        all_probs = []
+        all_labels = []
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images, labels = images.to(device), labels.to(device)
+                logits = model(images)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                all_probs.append(probs)
+                all_labels.append(labels.cpu().numpy())
+        probs = np.vstack(all_probs)
+        labels = np.vstack(all_labels)
+        test_auroc = roc_auc_score(labels, probs, average='macro')
+        print(f"Test AUROC: {test_auroc:.4f}")
+        mlflow.log_metric("test_auroc", test_auroc)
+
+if __name__ == "__main__":
+    main()
